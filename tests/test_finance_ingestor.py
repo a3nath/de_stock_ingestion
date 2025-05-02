@@ -2,35 +2,30 @@ import pytest
 from unittest.mock import MagicMock, patch
 import pandas as pd
 from datetime import datetime, timedelta
+from jsonschema import ValidationError
+import json
 # import boto3  # Commented out AWS SDK
 
 from src.ingestion.finance_ingestor import FinanceIngestor
 
-# Creating a mock GCS client
 @pytest.fixture
 def mock_storage():
-    with patch('google.cloud.storage.Client') as mock_storage:
+    with patch('google.cloud.storage.Client') as mock_client:
         mock_bucket = MagicMock()
         mock_blob = MagicMock()
-        
-        # Set up the mock bucket
-        mock_storage.return_value.get_bucket.return_value = mock_bucket
-        
-        # Set up the mock blob
+        mock_client.return_value.bucket.return_value = mock_bucket
         mock_bucket.blob.return_value = mock_blob
-        
-        yield mock_storage, mock_bucket, mock_blob
+        yield {
+            'client': mock_client,
+            'bucket': mock_bucket,
+            'blob': mock_blob
+        }
 
 @pytest.fixture
 def finance_ingestor(mock_storage):
-    _, mock_bucket, _ = mock_storage
-    
-    # Create a finance ingestor with mock storage
-    ingestor = FinanceIngestor(bucket_name="test-bucket", project_id="test-project")
-    
-    # Replace the real bucket with our mock
-    ingestor.bucket = mock_bucket
-    
+    ingestor = FinanceIngestor('test-bucket', 'test-project')
+    ingestor.storage_client = mock_storage['client']
+    ingestor.bucket = mock_storage['bucket']
     return ingestor
 
 @pytest.fixture
@@ -46,6 +41,19 @@ def sample_data():
         'Stock Splits': [0.0, 0.0]
     }, index=dates)
 
+@pytest.fixture
+def valid_stock_data():
+    return {
+        "symbol": "AAPL",
+        "date": datetime.now().isoformat(),
+        "open": 150.0,
+        "high": 155.0,
+        "low": 149.0,
+        "close": 152.0,
+        "volume": 1000000,
+        "ingestion_date": datetime.now().isoformat()
+    }
+
 def test_fetch_data(finance_ingestor, sample_data):
     with patch('yfinance.Ticker') as mock_ticker:
         mock_ticker.return_value.history.return_value = sample_data
@@ -56,7 +64,8 @@ def test_fetch_data(finance_ingestor, sample_data):
         assert len(df) == 2
         assert 'Open' in df.columns
         assert 'Close' in df.columns
-        
+        mock_ticker.return_value.history.assert_called_once()
+
 def test_validate_data(finance_ingestor):
     """Test the data validation functionality."""
     # Create a valid DataFrame
@@ -72,7 +81,7 @@ def test_validate_data(finance_ingestor):
     
     # Test with valid data - should pass
     assert finance_ingestor.validate_data(valid_df, 'AAPL') is True
-    
+
     # Test with empty DataFrame - should raise ValueError
     empty_df = pd.DataFrame()
     with pytest.raises(ValueError) as excinfo:
@@ -122,29 +131,54 @@ def test_validate_data(finance_ingestor):
     with pytest.raises(ValueError) as excinfo:
         finance_ingestor.validate_data(missing_values_df, 'AAPL')
     assert "has 1 missing values" in str(excinfo.value)
-   
+
+def test_validate_json_schema(finance_ingestor):
+    valid_data = json.dumps([{
+        "Open": 150.0,
+        "High": 155.0,
+        "Low": 149.0,
+        "Close": 152.0,
+        "Volume": 1000000,
+        "Dividends": 0.0,
+        "Stock Splits": 0.0,
+        "ingestion_date": datetime.now().isoformat(),
+        "source": "yahoo_finance"
+    }])
+    assert finance_ingestor.validate_json_schema(valid_data, 'AAPL') is True
+
+def test_validate_json_schema_invalid(finance_ingestor):
+    invalid_data = json.dumps([{
+        "Open": "not-a-number",  # Invalid type
+        "High": 155.0,
+        "Low": 149.0,
+        "Close": 152.0,
+        "Volume": 1000000,
+        "Dividends": 0.0,
+        "Stock Splits": 0.0,
+        "ingestion_date": "invalid-date",  # Invalid format
+        "source": "yahoo_finance"
+    }])
+    with pytest.raises(ValidationError):
+        finance_ingestor.validate_json_schema(invalid_data, 'AAPL')
+
 def test_upload_to_gcs(finance_ingestor, sample_data, mock_storage):
-    _, mock_bucket, mock_blob = mock_storage
-    
     # Call the upload method
-    finance_ingestor.upload_to_gcs(sample_data, 'AAPL')
+    blob_path = finance_ingestor.upload_to_gcs(sample_data, 'AAPL')
     
     # Verify blob creation and upload were called
-    mock_bucket.blob.assert_called_once()
-    mock_blob.upload_from_string.assert_called_once()
+    mock_storage['bucket'].blob.assert_called_once()
+    mock_storage['blob'].upload_from_string.assert_called_once()
     
     # Verify blob path format
-    blob_path = mock_bucket.blob.call_args[0][0]
     assert blob_path.startswith('raw/finance/AAPL/')
     assert blob_path.endswith('/data.json')
     
     # Verify metadata was set
-    assert mock_blob.metadata is not None
-    assert mock_blob.patch.called
+    assert mock_storage['blob'].metadata is not None
+    assert mock_storage['blob'].metadata['symbol'] == 'AAPL'
+    assert mock_storage['blob'].metadata['schema_version'] == '1.0'
 
 def test_process_daily_data(finance_ingestor, sample_data, mock_storage):
-    _, mock_bucket, mock_blob = mock_storage
-    
     with patch('yfinance.Ticker') as mock_ticker:
         # Mock yfinance
         mock_ticker.return_value.history.return_value = sample_data
@@ -154,4 +188,53 @@ def test_process_daily_data(finance_ingestor, sample_data, mock_storage):
         
         # Verify both fetch and upload were called
         mock_ticker.return_value.history.assert_called_once()
-        mock_blob.upload_from_string.assert_called_once() 
+        mock_storage['blob'].upload_from_string.assert_called_once()
+
+def test_upload_to_gcs_with_metadata(finance_ingestor, mock_storage, valid_stock_data):
+    """Test that upload includes metadata and validates schema"""
+    # Create DataFrame with correct column names
+    df = pd.DataFrame([{
+        'Open': 150.0,
+        'High': 155.0,
+        'Low': 149.0,
+        'Close': 152.0,
+        'Volume': 1000000,
+        'Dividends': 0.0,
+        'Stock Splits': 0.0,
+        'ingestion_date': datetime.now().isoformat(),
+        'source': 'yahoo_finance'
+    }])
+    
+    # Call the upload method
+    blob_path = finance_ingestor.upload_to_gcs(df, 'AAPL')
+    
+    # Verify blob creation and upload were called
+    mock_storage['bucket'].blob.assert_called_once()
+    mock_storage['blob'].upload_from_string.assert_called_once()
+    
+    # Verify metadata was set
+    assert mock_storage['blob'].metadata is not None
+    assert mock_storage['blob'].metadata['symbol'] == 'AAPL'
+    assert mock_storage['blob'].metadata['schema_version'] == '1.0'
+
+def test_process_daily_data_handles_validation(finance_ingestor, mock_storage):
+    """Test that process_daily_data validates data before upload"""
+    with patch('yfinance.Ticker') as mock_ticker:
+        # Mock yfinance
+        mock_df = pd.DataFrame({
+            'Open': [150.0],
+            'High': [155.0],
+            'Low': [149.0],
+            'Close': [152.0],
+            'Volume': [1000000],
+            'Dividends': [0.0],
+            'Stock Splits': [0.0]
+        }, index=[datetime.now()])
+        mock_ticker.return_value.history.return_value = mock_df
+        
+        # Process data
+        finance_ingestor.process_daily_data('AAPL')
+        
+        # Verify both fetch and upload were called
+        mock_ticker.return_value.history.assert_called_once()
+        mock_storage['blob'].upload_from_string.assert_called_once() 

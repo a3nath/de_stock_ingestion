@@ -1,6 +1,8 @@
 import logging
 import os
 from datetime import datetime, timedelta
+import json
+from jsonschema import validate, ValidationError
 
 # import boto3  # Commented out AWS SDK
 from google.cloud import storage  # Added Google Cloud Storage
@@ -21,6 +23,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class FinanceIngestor:
+    # Define the JSON schema for stock data
+    STOCK_DATA_SCHEMA = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits", "ingestion_date", "source"],
+            "properties": {
+                "Open": {"type": "number"},
+                "High": {"type": "number"},
+                "Low": {"type": "number"},
+                "Close": {"type": "number"},
+                "Volume": {"type": "number"},
+                "Dividends": {"type": "number"},
+                "Stock Splits": {"type": "number"},
+                "ingestion_date": {"type": "string", "format": "date-time"},
+                "source": {"type": "string"}
+            }
+        }
+    }
+
     def __init__(self, bucket_name=None, project_id=None):
         """
         Initialize the FinanceIngestor with Google Cloud Storage bucket name.
@@ -137,9 +159,42 @@ class FinanceIngestor:
         logger.info(f"Validation passed for {symbol} data with {len(df)} records")
         return True
 
+    def validate_json_schema(self, json_data, symbol):
+        """
+        Validate JSON data against the defined schema.
+        
+        Args:
+            json_data: JSON string to validate
+            symbol: Stock symbol for error messages
+            
+        Returns:
+            True if validation passes
+            
+        Raises:
+            ValidationError: If JSON schema validation fails
+        """
+        try:
+            # Parse JSON string to Python object
+            data = json.loads(json_data)
+            
+            # Validate against schema
+            validate(instance=data, schema=self.STOCK_DATA_SCHEMA)
+            
+            logger.info(f"JSON schema validation passed for {symbol} data")
+            return True
+            
+        except ValidationError as e:
+            error_message = f"JSON schema validation failed for {symbol} data: {str(e)}"
+            logger.error(error_message)
+            raise
+        except json.JSONDecodeError as e:
+            error_message = f"Invalid JSON data for {symbol}: {str(e)}"
+            logger.error(error_message)
+            raise
+
     def upload_to_gcs(self, df, symbol):
         """
-        Upload DataFrame to Google Cloud Storage.
+        Upload DataFrame to Google Cloud Storage with JSON schema validation.
         
         Args:
             df: DataFrame to upload
@@ -157,6 +212,9 @@ class FinanceIngestor:
             # Convert to JSON
             json_data = df.to_json(orient='records')
             
+            # Validate JSON schema
+            self.validate_json_schema(json_data, symbol)
+            
             # Generate GCS blob path (file path in GCS)
             date_str = datetime.now().strftime('%Y/%m/%d')
             blob_path = f"raw/finance/{symbol}/{date_str}/data.json"
@@ -172,7 +230,8 @@ class FinanceIngestor:
             metadata = {
                 'symbol': symbol,
                 'records': str(len(df)),
-                'ingestion_date': datetime.now().isoformat()
+                'ingestion_date': datetime.now().isoformat(),
+                'schema_version': '1.0'  # Added schema version tracking
             }
             blob.metadata = metadata
             blob.patch()
@@ -180,7 +239,7 @@ class FinanceIngestor:
             logger.info(f"Successfully uploaded data for {symbol} to gs://{self.bucket_name}/{blob_path}")
             return blob_path
             
-        except GoogleCloudError as e:
+        except (GoogleCloudError, ValidationError, json.JSONDecodeError) as e:
             logger.error(f"Error uploading to Google Cloud Storage: {str(e)}")
             raise
 

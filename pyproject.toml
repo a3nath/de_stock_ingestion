@@ -1,8 +1,10 @@
 [tool.poetry]
-name = "data-engineer-prj01"
+name = "de_stock_ingestion"
 version = "0.1.0"
 description = "End-to-end data engineering project with Medallion Architecture"
 authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.9"
@@ -14,6 +16,7 @@ yfinance = "^0.2.36"
 python-dotenv = "^1.0.0"
 structlog = "^23.2.0"
 numpy = "<2.0.0"
+jsonschema = "^4.21.1"  # Added for JSON schema validation
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"
