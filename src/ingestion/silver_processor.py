@@ -228,20 +228,12 @@ class SilverProcessor:
                         "error": str(e)
                     }
 
-            # Check numeric columns
-            numeric_columns = data.select_dtypes(include=[np.number]).columns
-            for col in numeric_columns:
-                if col in data.columns:
-                    results["consistency"][f"{col}_type"] = {
-                        "is_numeric": True
-                    }
-
             # Calculate overall quality score
             weights = {
-                "completeness": 0.3,
-                "validity": 0.3,
-                "uniqueness": 0.2,
-                "consistency": 0.2
+                "completeness": 0.25,
+                "validity": 0.25,
+                "uniqueness": 0.25,
+                "consistency": 0.25
             }
 
             # Calculate completeness score
