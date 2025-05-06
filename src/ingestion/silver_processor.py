@@ -189,8 +189,15 @@ class SilverProcessor:
             price_columns = ['Open', 'High', 'Low', 'Close']
             for col in price_columns:
                 if col in data.columns:
+                    #Check if the column is numeric
+                    results["validity"][f"{col}_validity_type"] = {
+                        "is_valid": data[col].dtype == 'float64'
+                    }
+            
+            for col in price_columns:
+                if col in data.columns:
                     invalid_prices = data[data[col] <= 0].shape[0]
-                    results["validity"][f"{col}_validity"] = {
+                    results["validity"][f"{col}_validity_range"] = {
                         "invalid_count": int(invalid_prices),
                         "is_valid": invalid_prices == 0
                     }
@@ -205,6 +212,18 @@ class SilverProcessor:
                 results["validity"]["high_price_validity"] = {
                     "invalid_count": int(invalid_highs),
                     "is_valid": invalid_highs == 0
+                }
+                
+            #Check Low <= Open, Close, High
+            if all(col in data.columns for col in ['High', 'Open', 'Low', 'Close']):
+                invalid_lows = data[
+                    (data['Low'] > data['Open']) |
+                    (data['Low'] > data['Close']) |
+                    (data['Low'] > data['High'])
+                ].shape[0]
+                results["validity"]["low_price_validity"] = {
+                    "invalid_count": int(invalid_lows),
+                    "is_valid": invalid_lows == 0
                 }
 
             # 3. Uniqueness Check
@@ -292,10 +311,83 @@ class SilverProcessor:
             data (pd.DataFrame): Raw data to transform
 
         Returns:
-            pd.DataFrame: Transformed data
+            pd.DataFrame: Transformed data ready for silver layer
         """
-        # TODO: Implement data transformation logic
-        pass
+        try:
+            logger.info("Starting data transformation")
+            
+            # Create a copy to avoid modifying original data
+            transformed_data = data.copy()
+            
+            # 1. Standardize column names
+            column_mapping = {
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume',
+                'date': 'Date',
+                'symbol': 'Symbol'
+            }
+            transformed_data.columns = [column_mapping.get(col.lower(), col) for col in transformed_data.columns]
+            
+            # 2. Convert data types
+            # Convert date to datetime
+            if 'Date' in transformed_data.columns:
+                transformed_data['Date'] = pd.to_datetime(transformed_data['Date'])
+            
+            # Convert price columns to float
+            price_columns = ['Open', 'High', 'Low', 'Close']
+            for col in price_columns:
+                if col in transformed_data.columns:
+                    transformed_data[col] = pd.to_numeric(transformed_data[col], errors='coerce')
+            
+            # Convert volume to integer
+            if 'Volume' in transformed_data.columns:
+                transformed_data['Volume'] = pd.to_numeric(transformed_data['Volume'], errors='coerce').fillna(0).astype(int)
+            
+            # 3. Add derived columns
+            # Calculate daily returns
+            if all(col in transformed_data.columns for col in ['Close', 'Open']):
+                transformed_data['Daily_Return'] = (
+                    (transformed_data['Close'] - transformed_data['Open']) / transformed_data['Open'] * 100
+                ).round(2)
+            
+            # Calculate price range
+            if all(col in transformed_data.columns for col in ['High', 'Low']):
+                transformed_data['Price_Range'] = (
+                    transformed_data['High'] - transformed_data['Low']
+                ).round(2)
+            
+            # 4. Handle missing values
+            # For price columns, forward fill missing values
+            for col in price_columns:
+                if col in transformed_data.columns:
+                    transformed_data[col] = transformed_data[col].fillna(method='ffill')
+            
+            # For volume, fill with 0
+            if 'Volume' in transformed_data.columns:
+                transformed_data['Volume'] = transformed_data['Volume'].fillna(0)
+            
+            # 5. Add metadata columns
+            transformed_data['Ingestion_Date'] = datetime.now().strftime('%Y-%m-%d')
+            transformed_data['Data_Source'] = 'Yahoo Finance'
+            transformed_data['Data_Layer'] = 'Silver'
+            
+            # 6. Sort by date
+            if 'Date' in transformed_data.columns:
+                transformed_data = transformed_data.sort_values('Date')
+            
+            # 7. Reset index
+            transformed_data = transformed_data.reset_index(drop=True)
+            
+            logger.info(f"Data transformation completed. Shape: {transformed_data.shape}")
+            return transformed_data
+            
+        except Exception as e:
+            error_msg = f"Error during data transformation: {str(e)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
     def _store_silver_data(self, data: pd.DataFrame, date: str) -> bool:
         """
