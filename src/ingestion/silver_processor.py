@@ -319,19 +319,7 @@ class SilverProcessor:
             # Create a copy to avoid modifying original data
             transformed_data = data.copy()
             
-            # 1. Standardize column names
-            column_mapping = {
-                'open': 'Open',
-                'high': 'High',
-                'low': 'Low',
-                'close': 'Close',
-                'volume': 'Volume',
-                'date': 'Date',
-                'symbol': 'Symbol'
-            }
-            transformed_data.columns = [column_mapping.get(col.lower(), col) for col in transformed_data.columns]
-            
-            # 2. Convert data types
+            # 1. Convert data types
             # Convert date to datetime
             if 'Date' in transformed_data.columns:
                 transformed_data['Date'] = pd.to_datetime(transformed_data['Date'])
@@ -346,7 +334,7 @@ class SilverProcessor:
             if 'Volume' in transformed_data.columns:
                 transformed_data['Volume'] = pd.to_numeric(transformed_data['Volume'], errors='coerce').fillna(0).astype(int)
             
-            # 3. Add derived columns
+            # 2. Add derived columns
             # Calculate daily returns
             if all(col in transformed_data.columns for col in ['Close', 'Open']):
                 transformed_data['Daily_Return'] = (
@@ -359,7 +347,7 @@ class SilverProcessor:
                     transformed_data['High'] - transformed_data['Low']
                 ).round(2)
             
-            # 4. Handle missing values
+            # 3. Handle missing values
             # For price columns, forward fill missing values
             for col in price_columns:
                 if col in transformed_data.columns:
@@ -369,16 +357,16 @@ class SilverProcessor:
             if 'Volume' in transformed_data.columns:
                 transformed_data['Volume'] = transformed_data['Volume'].fillna(0)
             
-            # 5. Add metadata columns
+            # 4. Add metadata columns
             transformed_data['Ingestion_Date'] = datetime.now().strftime('%Y-%m-%d')
             transformed_data['Data_Source'] = 'Yahoo Finance'
             transformed_data['Data_Layer'] = 'Silver'
             
-            # 6. Sort by date
+            # 5. Sort by date
             if 'Date' in transformed_data.columns:
                 transformed_data = transformed_data.sort_values('Date')
             
-            # 7. Reset index
+            # 6. Reset index
             transformed_data = transformed_data.reset_index(drop=True)
             
             logger.info(f"Data transformation completed. Shape: {transformed_data.shape}")
