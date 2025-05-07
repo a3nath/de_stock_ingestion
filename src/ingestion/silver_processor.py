@@ -387,9 +387,54 @@ class SilverProcessor:
 
         Returns:
             bool: True if storage was successful
+
+        Raises:
+            ValueError: If date format is invalid
+            Exception: If there are issues storing data
         """
-        # TODO: Implement silver data storage logic
-        pass
+        try:
+            logger.info(f"Storing silver layer data for date: {date}")
+            
+            # Validate date format
+            datetime.strptime(date, "%Y-%m-%d")
+            
+            # Create directory structure
+            year, month, day = date.split('-')
+            blob_path = f"{self.silver_prefix}/{year}/{month}/{day}/data.json"
+            
+            # Convert DataFrame to JSON
+            json_data = data.to_json(orient='records', date_format='iso')
+            
+            # Create blob and upload
+            blob = self.bucket.blob(blob_path)
+            blob.upload_from_string(
+                json_data,
+                content_type='application/json'
+            )
+            
+            # Set metadata
+            metadata = {
+                'date': date,
+                'record_count': str(len(data)),
+                'columns': ','.join(data.columns),
+                'ingestion_date': datetime.now().isoformat(),
+                'quality_score': str(self.metadata.get('quality_score', 0.0)),
+                'schema_version': '1.0'
+            }
+            blob.metadata = metadata
+            blob.patch()
+            
+            logger.info(f"Successfully stored silver data at gs://{self.bucket_name}/{blob_path}")
+            return True
+            
+        except ValueError as e:
+            error_msg = f"Invalid date format: {date}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        except Exception as e:
+            error_msg = f"Error storing silver data: {str(e)}"
+            logger.error(error_msg)
+            raise
 
     def _update_metadata(self, quality_results: Dict) -> None:
         """
