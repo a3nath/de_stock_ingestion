@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import json
 
 import pandas as pd
@@ -63,20 +63,39 @@ class SilverProcessor:
             self.metadata["processing_date"] = date
             self.metadata["status"] = "processing"
 
-            # Read raw data
+            # 1. Read raw data
             raw_data = self._read_raw_data(date)
             if raw_data.empty:
                 logger.warning(f"No data found for date: {date}")
+                self.metadata["status"] = "failed"
+                self.metadata["errors"].append("No data found")
                 return False
 
-            # TODO: Implement remaining steps:
             # 2. Apply data quality checks
-            # 3. Transform data if needed
-            # 4. Store in silver layer
-            # 5. Update metadata
-            # 6. Handle errors
+            quality_results = self._apply_quality_checks(raw_data)
+            self.metadata["quality_score"] = quality_results["quality_score"]
+            
+            # Check if quality score meets threshold
+            if quality_results["quality_score"] < 90:
+                logger.warning(f"Data quality score below threshold: {quality_results['quality_score']:.2f}")
+                self.metadata["errors"].append("Data quality score below threshold")
+                self.metadata["status"] = "failed"
+                return False
 
-            self.metadata["status"] = "completed"
+            # 3. Transform data
+            transformed_data = self._transform_data(raw_data)
+            
+            # 4. Store in silver layer
+            storage_success = self._store_silver_data(transformed_data, date)
+            if not storage_success:
+                logger.error("Failed to store data in silver layer")
+                self.metadata["status"] = "failed"
+                return False
+
+            # 5. Update metadata
+            self._update_metadata(quality_results)
+            
+            self.metadata["status"] = "success"
             logger.info(f"Successfully processed data for date: {date}")
             return True
 
@@ -319,55 +338,40 @@ class SilverProcessor:
             # Create a copy to avoid modifying original data
             transformed_data = data.copy()
             
-            # 1. Convert data types
-            # Convert date to datetime
-            if 'Date' in transformed_data.columns:
-                transformed_data['Date'] = pd.to_datetime(transformed_data['Date'])
+            # Standardize column names
+            column_mapping = {
+                'Open': 'open_price',
+                'High': 'high_price',
+                'Low': 'low_price',
+                'Close': 'close_price',
+                'Volume': 'volume',
+                'Dividends': 'dividends',
+                'Stock Splits': 'stock_splits'
+            }
+            transformed_data = transformed_data.rename(columns=column_mapping)
             
-            # Convert price columns to float
-            price_columns = ['Open', 'High', 'Low', 'Close']
+            # Convert data types
+            transformed_data['date'] = pd.to_datetime(transformed_data['Date'])
+            price_columns = ['open_price', 'high_price', 'low_price', 'close_price']
             for col in price_columns:
-                if col in transformed_data.columns:
-                    transformed_data[col] = pd.to_numeric(transformed_data[col], errors='coerce')
+                transformed_data[col] = transformed_data[col].astype(float)
             
-            # Convert volume to integer
-            if 'Volume' in transformed_data.columns:
-                transformed_data['Volume'] = pd.to_numeric(transformed_data['Volume'], errors='coerce').fillna(0).astype(int)
+            # Add derived columns
+            transformed_data['daily_return'] = transformed_data['close_price'].pct_change()
+            transformed_data['price_range'] = transformed_data['high_price'] - transformed_data['low_price']
             
-            # 2. Add derived columns
-            # Calculate daily returns
-            if all(col in transformed_data.columns for col in ['Close', 'Open']):
-                transformed_data['Daily_Return'] = (
-                    (transformed_data['Close'] - transformed_data['Open']) / transformed_data['Open'] * 100
-                ).round(2)
-            
-            # Calculate price range
-            if all(col in transformed_data.columns for col in ['High', 'Low']):
-                transformed_data['Price_Range'] = (
-                    transformed_data['High'] - transformed_data['Low']
-                ).round(2)
-            
-            # 3. Handle missing values
-            # For price columns, forward fill missing values
+            # Handle missing values
             for col in price_columns:
-                if col in transformed_data.columns:
-                    transformed_data[col] = transformed_data[col].fillna(method='ffill')
+                transformed_data[col] = transformed_data[col].ffill()  # Using ffill() instead of fillna(method='ffill')
+            transformed_data['volume'] = transformed_data['volume'].fillna(0)
             
-            # For volume, fill with 0
-            if 'Volume' in transformed_data.columns:
-                transformed_data['Volume'] = transformed_data['Volume'].fillna(0)
+            # Add metadata columns
+            transformed_data['ingestion_date'] = pd.Timestamp.now()
+            transformed_data['data_source'] = 'raw_layer'
+            transformed_data['data_layer'] = 'silver'
             
-            # 4. Add metadata columns
-            transformed_data['Ingestion_Date'] = datetime.now().strftime('%Y-%m-%d')
-            transformed_data['Data_Source'] = 'Yahoo Finance'
-            transformed_data['Data_Layer'] = 'Silver'
-            
-            # 5. Sort by date
-            if 'Date' in transformed_data.columns:
-                transformed_data = transformed_data.sort_values('Date')
-            
-            # 6. Reset index
-            transformed_data = transformed_data.reset_index(drop=True)
+            # Sort by date and reset index
+            transformed_data = transformed_data.sort_values('date').reset_index(drop=True)
             
             logger.info(f"Data transformation completed. Shape: {transformed_data.shape}")
             return transformed_data
@@ -436,12 +440,39 @@ class SilverProcessor:
             logger.error(error_msg)
             raise
 
-    def _update_metadata(self, quality_results: Dict) -> None:
-        """
-        Update processing metadata with results.
-
-        Args:
-            quality_results (Dict): Results from quality checks
-        """
-        # TODO: Implement metadata update logic
-        pass 
+    def _update_metadata(self, quality_results: Dict[str, Any]) -> None:
+        """Update processing metadata with quality check results."""
+        try:
+            logger.info("Updating processing metadata")
+            
+            # Convert NumPy types to Python native types
+            quality_results = {
+                k: float(v) if isinstance(v, (np.float32, np.float64)) else 
+                   int(v) if isinstance(v, (np.int32, np.int64)) else
+                   bool(v) if isinstance(v, np.bool_) else v
+                for k, v in quality_results.items()
+            }
+            
+            # Update quality metrics
+            self.metadata['quality_score'] = quality_results.get('quality_score', 0.0)
+            self.metadata['quality_results'] = quality_results
+            
+            # Update processing statistics
+            self.metadata['total_records'] = quality_results.get('total_records', 0)
+            self.metadata['processing_time'] = quality_results.get('processing_time', 0.0)
+            self.metadata['quality_threshold_met'] = quality_results.get('quality_threshold_met', False)
+            
+            # Store metadata
+            metadata_blob = self.bucket.blob(f"silver/metadata/{self.metadata['processing_date']}/processing_metadata.json")
+            metadata_blob.upload_from_string(
+                json.dumps(self.metadata, indent=2),
+                content_type='application/json'
+            )
+            
+            logger.info("Successfully updated processing metadata")
+            
+        except Exception as e:
+            logger.error(f"Error updating metadata: {str(e)}")
+            self.metadata['status'] = 'failed'
+            self.metadata['error'] = str(e)
+            raise 
