@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import json
 import pandas as pd
@@ -284,7 +284,7 @@ class BigQueryLoader:
             
             # Update current quality metrics
             self.metadata["quality_metrics"]["current"] = {
-                "quality_score": validation_results["quality_score"],
+                "quality_score": float(validation_results["quality_score"]),
                 "validation_results": validation_results,
                 "timestamp": datetime.now().isoformat()
             }
@@ -300,15 +300,32 @@ class BigQueryLoader:
                     self.metadata["quality_metrics"]["history"][-30:]
             
             # Update statistics
-            self.metadata["total_records_loaded"] = job.output_rows
+            self.metadata["total_records_loaded"] = int(job.output_rows)
             self.metadata["last_updated"] = datetime.now().isoformat()
+
+            # Helper to convert NumPy types to native Python types
+            def convert(obj):
+                if isinstance(obj, dict):
+                    return {k: convert(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert(i) for i in obj]
+                elif isinstance(obj, (np.integer, np.int32, np.int64)):
+                    return int(obj)
+                elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                    return float(obj)
+                elif isinstance(obj, (np.bool_, bool)):
+                    return bool(obj)
+                else:
+                    return obj
+
+            serializable_metadata = convert(self.metadata)
             
             # Store metadata
             metadata_blob = self.bucket.blob(
                 f"{self.gold_prefix}/bigquery_metadata/{self.metadata['last_loaded_date']}/loading_metadata.json"
             )
             metadata_blob.upload_from_string(
-                json.dumps(self.metadata, indent=2),
+                json.dumps(serializable_metadata, indent=2),
                 content_type='application/json'
             )
             
@@ -440,4 +457,217 @@ class BigQueryLoader:
                 field="date"
             )
             
-            return self.bigquery_client.create_table(table) 
+            return self.bigquery_client.create_table(table)
+            
+    def load_incremental_data(self, end_date: str = None, start_date: str = None):
+        """
+        Load only new stock data since the last processed date.
+        
+        Args:
+            end_date (str, optional): The end date to process up to (defaults to today)
+            start_date (str, optional): The start date to process from (defaults to day after last loaded date)
+            
+        Returns:
+            bool: True if loading was successful
+        """
+        # Determine the date range to process
+        if not start_date:
+            last_loaded_date = self._get_last_processed_date()
+            
+            if not last_loaded_date:
+                logger.info("No previous load found. Starting with initial load.")
+                # You might want to define how far back to go for initial load
+                start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            else:
+                # Start from the day after the last loaded date
+                start_date = (datetime.strptime(last_loaded_date, "%Y-%m-%d") + 
+                            timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Default end_date to today if not specified
+        if not end_date:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            
+        # Skip if already up to date
+        if start_date > end_date:
+            logger.info(f"Data already up to date. Last loaded: {last_loaded_date if 'last_loaded_date' in locals() else 'None'}")
+            return True
+        
+        logger.info(f"Loading incremental data from {start_date} to {end_date}")
+        
+        # Generate list of dates to process
+        dates_to_process = self._generate_date_range(start_date, end_date)
+        
+        # Filter out weekends and holidays
+        trading_dates = self._filter_trading_days(dates_to_process)
+        
+        if not trading_dates:
+            logger.info("No trading dates to process in the specified range")
+            return True
+            
+        success = True
+        processed_dates = []
+        
+        for date in trading_dates:
+            logger.info(f"Processing date: {date}")
+            if self.load_daily_data(date):
+                processed_dates.append(date)
+            else:
+                logger.error(f"Failed to load data for {date}")
+                success = False
+                # Continue with other dates instead of stopping
+        
+        logger.info(f"Incremental load completed. Processed {len(processed_dates)} out of {len(trading_dates)} dates.")
+        return success
+
+    def _get_last_processed_date(self):
+        """Get the last date for which data was successfully loaded."""
+        
+        # Query BigQuery for the most recent date
+        query = f"""
+            SELECT MAX(date) as last_date 
+            FROM `{self.project_id}.{self.dataset_id}.{self.table_id}`
+        """
+        try:
+            query_job = self.bigquery_client.query(query)
+            results = query_job.result()
+            for row in results:
+                if row.last_date:
+                    return row.last_date.strftime("%Y-%m-%d")
+        except Exception as e:
+            logger.warning(f"Could not query last processed date: {str(e)}")
+        
+        return None
+
+    def _generate_date_range(self, start_date, end_date):
+        """Generate a list of dates between start_date and end_date inclusive."""
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        date_list = []
+        current_dt = start_dt
+        while current_dt <= end_dt:
+            date_list.append(current_dt.strftime("%Y-%m-%d"))
+            current_dt += timedelta(days=1)
+        
+        return date_list
+
+    def _get_us_market_holidays(self, year):
+        """
+        Generate US stock market holidays for a given year.
+        
+        Args:
+            year (int): The year to generate holidays for
+            
+        Returns:
+            list: List of holiday dates in YYYY-MM-DD format
+        """
+        holidays = []
+        
+        # New Year's Day (January 1st)
+        new_years = datetime(year, 1, 1)
+        # If New Year's falls on a weekend, observe on Monday after or Friday before
+        if new_years.weekday() == 5:  # Saturday
+            holidays.append(datetime(year-1, 12, 31).strftime("%Y-%m-%d"))  # Observe on Friday before
+        elif new_years.weekday() == 6:  # Sunday
+            holidays.append(datetime(year, 1, 2).strftime("%Y-%m-%d"))  # Observe on Monday after
+        else:
+            holidays.append(new_years.strftime("%Y-%m-%d"))
+        
+        # Martin Luther King Jr. Day (3rd Monday in January)
+        mlk_day = datetime(year, 1, 1)
+        while mlk_day.weekday() != 0:  # Find first Monday
+            mlk_day += timedelta(days=1)
+        mlk_day += timedelta(days=14)  # Advance to 3rd Monday
+        holidays.append(mlk_day.strftime("%Y-%m-%d"))
+        
+        # Presidents' Day (3rd Monday in February)
+        presidents_day = datetime(year, 2, 1)
+        while presidents_day.weekday() != 0:  # Find first Monday
+            presidents_day += timedelta(days=1)
+        presidents_day += timedelta(days=14)  # Advance to 3rd Monday
+        holidays.append(presidents_day.strftime("%Y-%m-%d"))
+        
+        # Memorial Day (Last Monday in May)
+        memorial_day = datetime(year, 6, 1) - timedelta(days=1)
+        while memorial_day.weekday() != 0:  # Find last Monday in May
+            memorial_day -= timedelta(days=1)
+        holidays.append(memorial_day.strftime("%Y-%m-%d"))
+        
+        # Juneteenth (June 19th)
+        juneteenth = datetime(year, 6, 19)
+        # If Juneteenth falls on a weekend, observe on Monday after or Friday before
+        if juneteenth.weekday() == 5:  # Saturday
+            holidays.append(datetime(year, 6, 18).strftime("%Y-%m-%d"))  # Observe on Friday before
+        elif juneteenth.weekday() == 6:  # Sunday
+            holidays.append(datetime(year, 6, 20).strftime("%Y-%m-%d"))  # Observe on Monday after
+        else:
+            holidays.append(juneteenth.strftime("%Y-%m-%d"))
+        
+        # Independence Day (July 4th)
+        independence_day = datetime(year, 7, 4)
+        # If July 4th falls on a weekend, observe on Monday after or Friday before
+        if independence_day.weekday() == 5:  # Saturday
+            holidays.append(datetime(year, 7, 3).strftime("%Y-%m-%d"))  # Observe on Friday before
+        elif independence_day.weekday() == 6:  # Sunday
+            holidays.append(datetime(year, 7, 5).strftime("%Y-%m-%d"))  # Observe on Monday after
+        else:
+            holidays.append(independence_day.strftime("%Y-%m-%d"))
+        
+        # Labor Day (1st Monday in September)
+        labor_day = datetime(year, 9, 1)
+        while labor_day.weekday() != 0:  # Find first Monday
+            labor_day += timedelta(days=1)
+        holidays.append(labor_day.strftime("%Y-%m-%d"))
+        
+        # Thanksgiving Day (4th Thursday in November)
+        thanksgiving = datetime(year, 11, 1)
+        while thanksgiving.weekday() != 3:  # Find first Thursday
+            thanksgiving += timedelta(days=1)
+        thanksgiving += timedelta(days=21)  # Advance to 4th Thursday
+        holidays.append(thanksgiving.strftime("%Y-%m-%d"))
+        
+        # Christmas Day (December 25th)
+        christmas = datetime(year, 12, 25)
+        # If Christmas falls on a weekend, observe on Monday after or Friday before
+        if christmas.weekday() == 5:  # Saturday
+            holidays.append(datetime(year, 12, 24).strftime("%Y-%m-%d"))  # Observe on Friday before
+        elif christmas.weekday() == 6:  # Sunday
+            holidays.append(datetime(year, 12, 26).strftime("%Y-%m-%d"))  # Observe on Monday after
+        else:
+            holidays.append(christmas.strftime("%Y-%m-%d"))
+        
+        return holidays
+
+    def _filter_trading_days(self, date_list):
+        """Filter out weekends and holidays from the date list."""
+        trading_days = []
+        
+        # Generate holiday list for all years in the date range
+        years = set()
+        holidays = []
+        
+        # Collect years from date_list
+        for date_str in date_list:
+            date_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            years.add(date_dt.year)
+        
+        # Generate holidays for all years in the range
+        for year in years:
+            holidays.extend(self._get_us_market_holidays(year))
+        
+        for date_str in date_list:
+            date_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # Skip weekends (5=Saturday, 6=Sunday)
+            if date_dt.weekday() >= 5:
+                logger.debug(f"Skipping weekend: {date_str}")
+                continue
+            
+            # Skip holidays
+            if date_str in holidays:
+                logger.debug(f"Skipping holiday: {date_str}")
+                continue
+            
+            trading_days.append(date_str)
+        
+        return trading_days 
