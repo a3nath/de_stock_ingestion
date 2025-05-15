@@ -65,7 +65,7 @@ def test_fetch_data(finance_ingestor, sample_data):
         assert 'Open' in df.columns
         assert 'Close' in df.columns
         mock_ticker.return_value.history.assert_called_once()
-
+        
 def test_validate_data(finance_ingestor):
     """Test the data validation functionality."""
     # Create a valid DataFrame
@@ -81,7 +81,7 @@ def test_validate_data(finance_ingestor):
     
     # Test with valid data - should pass
     assert finance_ingestor.validate_data(valid_df, 'AAPL') is True
-
+    
     # Test with empty DataFrame - should raise ValueError
     empty_df = pd.DataFrame()
     with pytest.raises(ValueError) as excinfo:
@@ -131,7 +131,7 @@ def test_validate_data(finance_ingestor):
     with pytest.raises(ValueError) as excinfo:
         finance_ingestor.validate_data(missing_values_df, 'AAPL')
     assert "has 1 missing values" in str(excinfo.value)
-
+   
 def test_validate_json_schema(finance_ingestor):
     valid_data = json.dumps([{
         "Open": 150.0,
