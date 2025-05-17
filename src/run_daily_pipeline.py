@@ -9,6 +9,15 @@ from typing import List, Optional
 # Set up proper Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env file
+    load_dotenv()
+    print("Loaded environment variables from .env file")
+except ImportError:
+    print("dotenv package not found. Using existing environment variables.")
+
 # Import pipeline components
 from src.ingestion.finance_ingestor import FinanceIngestor
 from src.ingestion.silver_processor import SilverProcessor
