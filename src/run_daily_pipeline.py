@@ -62,12 +62,12 @@ def run_pipeline(date: Optional[str] = None, symbols: List[str] = None) -> bool:
     if not symbols:
         symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "VT", "ITOT"]
     
-    # Load environment variables
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    # Load environment variables - using the same variable names as finance_ingestor.py
+    project_id = os.environ.get("GCS_PROJECT_ID")
     bucket_name = os.environ.get("GCS_BUCKET_NAME")
     
     if not project_id or not bucket_name:
-        logger.error("Missing required environment variables: GOOGLE_CLOUD_PROJECT or GCS_BUCKET_NAME")
+        logger.error("Missing required environment variables: GCS_PROJECT_ID or GCS_BUCKET_NAME")
         return False
     
     logger.info(f"Processing date: {date}")
@@ -76,7 +76,7 @@ def run_pipeline(date: Optional[str] = None, symbols: List[str] = None) -> bool:
     try:
         # Step 1: Ingest raw data
         logger.info("Starting raw data ingestion")
-        ingestor = FinanceIngestor(bucket_name=bucket_name)
+        ingestor = FinanceIngestor(bucket_name=bucket_name, project_id=project_id)
         
         for symbol in symbols:
             try:
